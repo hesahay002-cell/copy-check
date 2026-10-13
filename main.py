@@ -1,5 +1,6 @@
 import os
 import tempfile
+import fitz  # PyMuPDF
 from fastapi import FastAPI, Form, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
