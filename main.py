@@ -1,5 +1,8 @@
 import os
 import tempfile
+import io
+import base64
+from PIL import Image
 import fitz  # PyMuPDF
 from fastapi import FastAPI, Form, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,14 +23,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Groq API Configuration (Free & Fast Vision Model)
+# Groq API Configuration 
 os.environ["GROQ_API_KEY"] = "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"
 client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=os.environ.get("GROQ_API_KEY"),
 )
 
-# In-memory storage for deployment testing
 TESTS_DB = {}
 RESULTS_DB = {}
 
@@ -91,12 +93,24 @@ async def evaluate_student_copy(
     
     test = TESTS_DB[test_id]
     
-    # Prepare images for Groq Llama Vision
-    import base64
+    # Image Compression and Preparation for Groq API
     image_contents = []
     for page in answer_pages:
         content = await page.read()
-        encoded = base64.b64encode(content).decode("utf-8")
+        try:
+            # Compress using Pillow
+            img = Image.open(io.BytesIO(content))
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            # Resize image to max 1200x1200px to avoid 413 Too Large Error
+            img.thumbnail((1200, 1200))
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=65) # Quality reduced to save size
+            encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        except Exception:
+            # Fallback if image fails to process
+            encoded = base64.b64encode(content).decode("utf-8")
+
         image_contents.append({
             "type": "image_url",
             "image_url": {
