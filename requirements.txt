@@ -5,3 +5,4 @@ openai
 reportlab
 openpyxl
 PyMuPDF
+Pillow
