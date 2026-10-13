@@ -23,13 +23,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Groq API Configuration 
+# Groq API Configuration (Free & Fast Vision Model)
 os.environ["GROQ_API_KEY"] = "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"
 client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=os.environ.get("GROQ_API_KEY"),
 )
 
+# In-memory storage for deployment testing
 TESTS_DB = {}
 RESULTS_DB = {}
 
@@ -98,14 +99,14 @@ async def evaluate_student_copy(
     for page in answer_pages:
         content = await page.read()
         try:
-            # Compress using Pillow
+            # Compress using Pillow to avoid 413 Error
             img = Image.open(io.BytesIO(content))
             if img.mode != 'RGB':
                 img = img.convert('RGB')
-            # Resize image to max 1200x1200px to avoid 413 Too Large Error
+            # Resize image to max 1200x1200px
             img.thumbnail((1200, 1200))
             buffer = io.BytesIO()
-            img.save(buffer, format="JPEG", quality=65) # Quality reduced to save size
+            img.save(buffer, format="JPEG", quality=65)
             encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
         except Exception:
             # Fallback if image fails to process
@@ -138,8 +139,9 @@ async def evaluate_student_copy(
     ]
 
     try:
+        # Updated to the new active 11b vision model
         completion = client.chat.completions.create(
-            model="llama-3.2-90b-vision-preview",
+            model="llama-3.2-11b-vision-preview",
             messages=messages,
             max_tokens=2000
         )
