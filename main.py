@@ -177,7 +177,7 @@ async def evaluate_student_copy(
     story.append(Spacer(1, 15))
     story.append(Paragraph(f"<b>Marks Awarded:</b> {awarded_marks} / {test['total_marks']}", styles['Heading1']))
     story.append(Spacer(1, 10))
-    story.append(Paragraph(<b>Evaluation Feedback & Cause of Deduction:</b>, styles['Heading3']))
+    story.append(Paragraph("<b>Evaluation Feedback & Cause of Deduction:</b>", styles['Heading3']))
     story.append(Paragraph(feedback.replace('\n', '<br/>'), styles['Normal']))
     story.append(Spacer(1, 20))
     story.append(Paragraph("<b>POWERED BY RAVISH SIR</b>", styles['Italic']))
@@ -203,7 +203,7 @@ def download_results_pdf(test_id: str):
     pdf_path = tempfile.mktemp(suffix=".pdf")
     doc = SimpleDocTemplate(pdf_path, pagesize=letter)
     styles = getSampleStyleSheet()
-    story = [Paragraph(<b>Safal Academy Live - Merit List</b>, styles['Title']), Spacer(1, 10)]
+    story = [Paragraph("<b>Safal Academy Live - Merit List</b>", styles['Title']), Spacer(1, 10)]
     
     for r in results:
         story.append(Paragraph(f"<b>{r['name']}</b> ({r['school']}) - Marks: {r['marks']} / {r['total']}", styles['Normal']))
