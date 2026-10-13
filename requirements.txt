@@ -3,4 +3,5 @@ uvicorn
 python-multipart
 openai
 reportlab
-pypdf
+openpyxl
+PyMuPDF
