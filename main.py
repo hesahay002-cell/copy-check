@@ -3,15 +3,17 @@ import tempfile
 import io
 import base64
 from PIL import Image
-import fitz  # PyMuPDF
 from fastapi import FastAPI, Form, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from openai import OpenAI
 import openpyxl
+
+# Colorful PDF Libraries
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
 
 app = FastAPI()
 
@@ -23,7 +25,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Groq API Configuration (Free & Fast Vision Model)
+# Groq API Configuration (Using Active Qwen Vision Model)
 os.environ["GROQ_API_KEY"] = "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"
 client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
@@ -99,17 +101,15 @@ async def evaluate_student_copy(
     for page in answer_pages:
         content = await page.read()
         try:
-            # Compress using Pillow to avoid 413 Error
+            # Compress using Pillow to avoid Size Errors
             img = Image.open(io.BytesIO(content))
             if img.mode != 'RGB':
                 img = img.convert('RGB')
-            # Resize image to max 1200x1200px
             img.thumbnail((1200, 1200))
             buffer = io.BytesIO()
             img.save(buffer, format="JPEG", quality=65)
             encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
         except Exception:
-            # Fallback if image fails to process
             encoded = base64.b64encode(content).decode("utf-8")
 
         image_contents.append({
@@ -139,9 +139,9 @@ async def evaluate_student_copy(
     ]
 
     try:
-        # Updated to the new active 11b vision model
+        # Updated to the new active Qwen Multimodal Model on Groq
         completion = client.chat.completions.create(
-            model="llama-3.2-11b-vision-preview",
+            model="qwen/qwen3.8-27b",
             messages=messages,
             max_tokens=2000
         )
@@ -177,26 +177,94 @@ async def evaluate_student_copy(
     }
     RESULTS_DB[test_id].append(result_record)
 
-    # Generate PDF Report Card
+    # -----------------------------------------------------
+    # Generate Colorful Professional PDF Report Card
+    # -----------------------------------------------------
     pdf_path = tempfile.mktemp(suffix=".pdf")
     doc = SimpleDocTemplate(pdf_path, pagesize=letter)
     styles = getSampleStyleSheet()
+    
+    # Custom PDF Styles
+    title_style = ParagraphStyle(
+        name='MainTitle', parent=styles['Heading1'],
+        fontSize=20, textColor=colors.HexColor("#FFFFFF"),
+        alignment=1, spaceAfter=8
+    )
+    subtitle_style = ParagraphStyle(
+        name='SubTitle', parent=styles['Heading3'],
+        fontSize=12, textColor=colors.HexColor("#FFFFFF"),
+        alignment=1, spaceAfter=10
+    )
+    feedback_style = ParagraphStyle(
+        name='FeedbackStyle', parent=styles['Normal'],
+        fontSize=11, leading=16, textColor=colors.HexColor("#1F2937")
+    )
+    footer_style = ParagraphStyle(
+        name='FooterStyle', parent=styles['Italic'],
+        fontSize=12, alignment=1, textColor=colors.HexColor("#DC2626"), spaceBefore=30
+    )
+
     story = []
 
-    story.append(Paragraph("<b>Safal Academy Live</b>", styles['Title']))
-    story.append(Paragraph("<b>Barganda, Giridih - Detailed Evaluation Report</b>", styles['Heading2']))
-    story.append(Spacer(1, 10))
-    story.append(Paragraph(f"<b>Student Name:</b> {student_name}", styles['Normal']))
-    story.append(Paragraph(f"<b>Class:</b> {student_class} | <b>School:</b> {school_name}", styles['Normal']))
-    story.append(Paragraph(f"<b>Test Code:</b> {test['test_code']} | <b>Subject:</b> {test['subject']}", styles['Normal']))
-    story.append(Paragraph(f"<b>Evaluated By:</b> RAVISH SIR", styles['Normal']))
-    story.append(Spacer(1, 15))
-    story.append(Paragraph(f"<b>Marks Awarded:</b> {awarded_marks} / {test['total_marks']}", styles['Heading1']))
-    story.append(Spacer(1, 10))
-    story.append(Paragraph("<b>Evaluation Feedback & Cause of Deduction:</b>", styles['Heading3']))
-    story.append(Paragraph(feedback.replace('\n', '<br/>'), styles['Normal']))
+    # 1. Header Banner (Deep Blue Background)
+    header_data = [
+        [Paragraph("<b>SAFAL ACADEMY LIVE</b>", title_style)],
+        [Paragraph("<b>Barganda, Giridih - Detailed Evaluation Report</b>", subtitle_style)]
+    ]
+    header_table = Table(header_data, colWidths=[500])
+    header_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor("#1E3A8A")), 
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+        ('TOPPADDING', (0, 0), (-1, -1), 10),
+    ]))
+    story.append(header_table)
     story.append(Spacer(1, 20))
-    story.append(Paragraph("<b>POWERED BY RAVISH SIR</b>", styles['Italic']))
+
+    # 2. Student Details Section (Bordered Table)
+    details_data = [
+        ["Student Name:", student_name, "Class:", student_class],
+        ["School Name:", school_name, "Evaluated By:", "RAVISH SIR"],
+        ["Test Code:", test['test_code'], "Subject:", test['subject']]
+    ]
+    details_table = Table(details_data, colWidths=[100, 150, 90, 160])
+    details_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor("#F3F4F6")),
+        ('BACKGROUND', (2, 0), (2, -1), colors.HexColor("#F3F4F6")),
+        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor("#111827")),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTNAME', (2, 0), (2, -1), 'Helvetica-Bold'),
+        ('GRID', (0, 0), (-1, -1), 1, colors.HexColor("#D1D5DB")),
+        ('PADDING', (0, 0), (-1, -1), 10),
+    ]))
+    story.append(details_table)
+    story.append(Spacer(1, 20))
+
+    # 3. Marks Awarded Highlight (Green if passed, Red if failed)
+    marks_percentage = (awarded_marks / test['total_marks']) * 100 if test['total_marks'] > 0 else 0
+    marks_color = colors.HexColor("#16A34A") if marks_percentage >= 40 else colors.HexColor("#DC2626") 
+    bg_color = colors.HexColor("#ECFDF5") if marks_percentage >= 40 else colors.HexColor("#FEF2F2")
+
+    marks_data = [[Paragraph(f"<b>TOTAL MARKS AWARDED: {awarded_marks} / {test['total_marks']}</b>", ParagraphStyle(name='marks', fontSize=15, textColor=marks_color, alignment=1))]]
+    marks_table = Table(marks_data, colWidths=[500])
+    marks_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), bg_color),
+        ('BORDER', (0, 0), (-1, -1), 2, marks_color),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('PADDING', (0, 0), (-1, -1), 15),
+    ]))
+    story.append(marks_table)
+    story.append(Spacer(1, 20))
+
+    # 4. Detailed Feedback Section
+    story.append(Paragraph("<b><font color='#2563EB'>Detailed Evaluation Feedback & Deductions:</font></b>", styles['Heading3']))
+    story.append(Spacer(1, 5))
+    clean_feedback = feedback.replace('\n', '<br/>')
+    story.append(Paragraph(clean_feedback, feedback_style))
+    
+    # 5. Footer
+    story.append(Spacer(1, 20))
+    story.append(Paragraph("<b>POWERED BY RAVISH SIR</b>", footer_style))
 
     doc.build(story)
 
