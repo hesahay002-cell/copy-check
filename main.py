@@ -306,9 +306,124 @@ Return the transcription page by page. For each answer fragment include:
     return "\n\n".join(all_page_notes)
 
 
+
+def audit_evaluation_against_original_images(
+    questions: list, student_transcription: str, student_page_urls: list
+) -> list:
+    """
+    Second-pass visual audit: check the evaluator's reading/legibility decisions
+    against the actual student page images. This is especially important when
+    a readable but scientifically wrong word was mistaken for illegible writing.
+    """
+    audited = [dict(item) for item in questions]
+    if not student_page_urls:
+        return audited
+
+    for start in range(0, len(student_page_urls), VISION_IMAGES_PER_REQUEST):
+        batch_urls = student_page_urls[start:start + VISION_IMAGES_PER_REQUEST]
+        first_page = start + 1
+        last_page = start + len(batch_urls)
+
+        relevant = []
+        for item in audited:
+            page_numbers = {
+                int(x) for x in re.findall(r"\d+", str(item.get("pages_found", "")))
+            }
+            if any(first_page <= n <= last_page for n in page_numbers):
+                relevant.append(item)
+
+        if not relevant:
+            continue
+
+        prompt = f"""
+You are performing a STRICT VISUAL QUALITY-CONTROL AUDIT of an already graded
+student answer sheet. The attached images are the ORIGINAL handwritten pages
+{first_page} through {last_page}. Inspect the handwriting yourself; do not rely
+only on the previous transcription.
+
+PREVIOUS TRANSCRIPTION FOR CONTEXT:
+{student_transcription[:18000]}
+
+CURRENT QUESTION EVALUATIONS TO CHECK:
+{json.dumps(relevant, ensure_ascii=False)[:14000]}
+
+For each listed question whose answer appears on these attached pages:
+1. Check the exact words in the original handwriting, especially words previously
+   described as [unclear handwriting] or illegible.
+2. If a word is readable, give the actual likely word. Never label a readable
+   wrong answer as illegible. If it is genuinely unreadable, keep it unclear.
+3. Check whether the scientific statement is correct. Do not confuse the colour
+   of a solution with the colour of a deposit/precipitate.
+4. Keep marks unchanged unless the visual evidence proves the existing marking
+   was based on a misread word or factual mistake. Apply the teacher's ideal
+   answer and the stated maximum marks.
+5. If the image does not contain that question's answer, do not change it.
+6. Do not invent letters or award marks for content that is not visible.
+
+Return ONLY JSON:
+{{
+ "corrections": [
+  {{
+   "question_number": "2",
+   "student_answer_correction": "Corrected faithful transcription, or empty if unchanged",
+   "awarded_marks": 1.5,
+   "deduction_reason": "Specific scientific error/missing point, not a legibility claim unless truly unreadable",
+   "review_required": false,
+   "review_reason": "",
+   "visual_evidence": "Brief description of the visible word/line"
+  }}
+ ]
+}}
+If no changes are needed, return {{"corrections":[]}}.
+"""
+        raw = call_vision(prompt, batch_urls, max_tokens=3500, json_mode=True)
+        audit_data = parse_json_response(raw)
+        corrections = audit_data.get("corrections", [])
+        if not isinstance(corrections, list):
+            continue
+
+        for correction in corrections:
+            qnum = str(correction.get("question_number", "")).strip()
+            target = next(
+                (item for item in audited
+                 if str(item.get("question_number", "")).strip() == qnum),
+                None
+            )
+            if target is None:
+                continue
+
+            corrected_answer = str(
+                correction.get("student_answer_correction", "")
+            ).strip()
+            if corrected_answer:
+                target["student_answer"] = corrected_answer
+
+            # Marks can only be changed within the question's printed range.
+            if correction.get("awarded_marks") is not None:
+                try:
+                    revised = float(correction["awarded_marks"])
+                    if 0 <= revised <= float(target["max_marks"]):
+                        target["awarded_marks"] = round(revised, 2)
+                except (TypeError, ValueError):
+                    pass
+
+            reason = str(correction.get("deduction_reason", "")).strip()
+            if reason:
+                target["deduction_reason"] = reason
+
+            target["review_required"] = bool(
+                correction.get("review_required", target["review_required"])
+            )
+            target["review_reason"] = str(
+                correction.get("review_reason", target.get("review_reason", ""))
+            ).strip()
+
+    return audited
+
+
 # -------------------------- QUESTION-WISE EVALUATION ------------------------
 
-def evaluate_all_questions(test: dict, student_transcription: str) -> dict:
+def evaluate_all_questions(test: dict, student_transcription: str, student_page_urls: list = None) -> dict:
     prompt = f"""
 You are the lead examiner for Safal Academy Live, Giridih. Evaluate a student's
 handwritten answer sheet. You must follow the teacher's two uploaded PDFs.
@@ -362,17 +477,31 @@ MANDATORY PROCESS:
 9. Partial marks must reflect correct visible points/steps. Do not double-penalize
    the same error. Accept scientifically/mathematically equivalent answers when
    consistent with the teacher's ideal answer.
-10. If a question's marks are not shown in the teacher's PDF, infer a fair
+10. CRITICAL: Separate handwriting legibility from answer correctness. If a word
+    can reasonably be read, transcribe the most likely word and assess whether
+    it is scientifically correct. Do NOT call a readable but incorrect word
+    "illegible". Use [unclear handwriting] only when the actual letters cannot
+    reasonably be distinguished from the page image/transcription.
+11. For science answers, identify exactly WHAT the student says changes. For
+    example, the blue copper sulphate SOLUTION turns green; reddish-brown copper
+    DEPOSITS on the iron nail. Do not confuse the solution colour with the metal
+    deposit colour. If the student writes that the solution turns brown, mark
+    that scientific statement incorrect, not illegible.
+12. If the transcription contains [unclear handwriting] but the surrounding
+    letters suggest a likely word, do not guess silently. Set review_required=true
+    only if the image audit also cannot read it; otherwise transcribe the word
+    and mark its scientific correctness.
+13. If a question's marks are not shown in the teacher's PDF, infer a fair
     allocation across questions only if needed to reach the test total, and
     clearly flag this in overall_feedback and review_required.
-11. The sum of max_marks must not exceed the test total. If the paper's printed
+14. The sum of max_marks must not exceed the test total. If the paper's printed
     question marks conflict with the declared test total, preserve the printed
     marks and set overall_review_required=true; do not silently rescale.
-12. Never invent a student answer, ideal answer, question, marks allocation,
+15. Never invent a student answer, ideal answer, question, marks allocation,
     or page number.
-13. The total awarded score is provisional if any question has null marks or
+16. The total awarded score is provisional if any question has null marks or
     review_required=true. The PDF must clearly flag teacher review.
-14. Return ONLY a valid JSON object. No Markdown fences or extra commentary.
+17. Return ONLY a valid JSON object. No Markdown fences or extra commentary.
 
 JSON shape:
 {{
@@ -443,6 +572,19 @@ JSON shape:
             "review_required": review_required,
             "review_reason": str(q.get("review_reason", "")),
         })
+
+    # Verify potentially questionable handwriting/legibility decisions against
+    # the original page images before calculating the final score.
+    cleaned = audit_evaluation_against_original_images(
+        cleaned, student_transcription, student_page_urls or []
+    )
+
+    # Recalculate totals after the visual audit may have corrected a misread.
+    awarded_sum = sum(
+        float(item["awarded_marks"])
+        for item in cleaned if item["awarded_marks"] is not None
+    )
+    pending_count = sum(1 for item in cleaned if item["review_required"])
 
     if max_sum > float(test["total_marks"]) + 0.01:
         data["overall_review_required"] = True
@@ -831,7 +973,7 @@ async def evaluate_student_copy(
         student_transcription = read_student_copy_pages(student_page_urls)
 
         # 4. Match all answer fragments across the complete copy, then evaluate.
-        evaluation = evaluate_all_questions(test, student_transcription)
+        evaluation = evaluate_all_questions(test, student_transcription, student_page_urls)
 
         # 5. Build PDF only after successful AI evaluation.
         pdf_path = build_result_pdf(
