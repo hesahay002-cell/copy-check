@@ -3,7 +3,6 @@ uvicorn[standard]
 python-multipart
 openai
 Pillow
+PyMuPDF
 openpyxl
 reportlab
-pypdf
-PyMuPDF
