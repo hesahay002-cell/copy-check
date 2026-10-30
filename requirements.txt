@@ -6,3 +6,4 @@ Pillow
 openpyxl
 reportlab
 pypdf
+PyMuPDF
