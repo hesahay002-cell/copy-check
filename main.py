@@ -1,32 +1,44 @@
 import os
 import io
 import re
-import base64
+import json
 import html
 import tempfile
+import base64
 from typing import List, Optional
 
+import fitz  # PyMuPDF: render teacher PDFs, including scanned/image PDFs
+import openpyxl
+from PIL import Image, ImageOps
 from fastapi import FastAPI, Form, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from openai import OpenAI
-from PIL import Image, ImageOps
 from pypdf import PdfReader
-import openpyxl
 
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
+)
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
 
-# ------------------------------------------------------------
-# SAFAL ACADEMY LIVE - AI COPY EVALUATOR BACKEND
+# ============================================================
+# SAFAL ACADEMY LIVE - AI COPY EVALUATOR
 # Render Start Command:
 # uvicorn main:app --host 0.0.0.0 --port $PORT
-# ------------------------------------------------------------
+#
+# Render Environment Variables:
+# GROQ_API_KEY = your new Groq API key
+# GROQ_MODEL   = qwen/qwen3.8-27b (or a currently enabled
+#                Groq vision model available in your account)
+# ============================================================
 
-app = FastAPI(title="Safal Academy Live - AI Copy Evaluator", version="2.0.0")
+app = FastAPI(
+    title="Safal Academy Live - AI Copy Evaluator",
+    version="3.0.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,8 +48,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# API key is read ONLY from Render Environment Variables.
-# Render variable name must be: GROQ_API_KEY
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b").strip()
 
@@ -50,30 +60,26 @@ if GROQ_API_KEY:
         max_retries=1,
     )
 
-# NOTE: These dictionaries are temporary memory storage.
-# Render restarts/redeploys can clear them. Re-publish tests after a restart.
+# Temporary memory storage: tests/results are cleared when Render restarts.
 TESTS_DB = {}
 RESULTS_DB = {}
 
-TEACHER_PIN = "525077"  # Kept as requested. Change it later if needed.
+# Teacher PIN intentionally kept as requested.
+TEACHER_PIN = "525077"
 
 
-# -------------------------- HELPERS --------------------------
+# ---------------------------- PDF / IMAGE HELPERS ----------------------------
 
 def extract_pdf_text(pdf_bytes: bytes) -> str:
-    """Extract selectable text from a PDF. Scanned image-only PDFs may return empty text."""
+    """Extract selectable text; scanned PDFs are handled by PDF image rendering too."""
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
-        pages = []
-        for page in reader.pages:
-            pages.append(page.extract_text() or "")
-        return "\n".join(pages).strip()
+        return "\n".join((page.extract_text() or "") for page in reader.pages).strip()
     except Exception:
         return ""
 
 
-def image_to_data_url(raw_bytes: bytes) -> str:
-    """Compress an uploaded image and return a base64 data URL."""
+def image_bytes_to_data_url(raw_bytes: bytes) -> str:
     try:
         with Image.open(io.BytesIO(raw_bytes)) as source:
             image = ImageOps.exif_transpose(source).convert("RGB")
@@ -85,7 +91,26 @@ def image_to_data_url(raw_bytes: bytes) -> str:
     except Exception as exc:
         raise HTTPException(
             status_code=400,
-            detail=f"Uploaded answer page is not a valid image: {exc}"
+            detail=f"Invalid answer-sheet image ({exc}). Please upload a clear JPG/PNG photo."
+        )
+
+
+def pdf_to_image_data_urls(pdf_bytes: bytes, label: str) -> list:
+    """Render PDF pages to images so AI can read scanned and ordinary PDF pages."""
+    try:
+        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+        urls = []
+        for page_number in range(len(document)):
+            page = document.load_page(page_number)
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(1.45, 1.45), alpha=False)
+            raw = pixmap.tobytes("png")
+            urls.append(image_bytes_to_data_url(raw))
+        document.close()
+        return urls
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not read {label} PDF. Please upload a valid PDF. Details: {exc}"
         )
 
 
@@ -93,114 +118,270 @@ def get_ai_client():
     if not GROQ_API_KEY or client is None:
         raise HTTPException(
             status_code=503,
-            detail="GROQ_API_KEY is missing in Render Environment Variables."
+            detail="AI service is not configured. Please contact the teacher."
         )
     return client
 
 
-def ask_groq_for_batch(prompt: str, image_urls: list) -> str:
-    """Qwen vision accepts a maximum of 3 images in one request."""
+def call_vision_ai(prompt: str, image_urls: list, max_tokens: int = 3000) -> str:
     content = [{"type": "text", "text": prompt}]
-    for image_url in image_urls:
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": image_url}
-        })
+    for url in image_urls:
+        content.append({"type": "image_url", "image_url": {"url": url}})
 
     response = get_ai_client().chat.completions.create(
         model=GROQ_MODEL,
         messages=[{"role": "user", "content": content}],
-        max_completion_tokens=3000,
+        max_completion_tokens=max_tokens,
     )
     answer = response.choices[0].message.content
-    if not answer:
+    if not answer or not answer.strip():
         raise RuntimeError("AI returned an empty response.")
-    return answer
+    return answer.strip()
 
 
-def finalise_marks(notes: str, test: dict) -> str:
-    prompt = f"""
-You are a careful CBSE/ICSE school examiner for Safal Academy Live, Giridih.
+def transcribe_teacher_pdf(pdf_bytes: bytes, pdf_label: str) -> str:
+    """
+    AI reads the teacher's uploaded PDF itself.
+    Text extraction supports searchable PDFs; rendered page images support scanned PDFs.
+    """
+    extracted_text = extract_pdf_text(pdf_bytes)
+    page_images = pdf_to_image_data_urls(pdf_bytes, pdf_label)
 
-Evaluate the student's complete answer sheet using the question paper and ideal answer
-reference below. The page-wise AI observations are also provided.
+    observations = []
+    for start in range(0, len(page_images), 3):
+        batch = page_images[start:start + 3]
+        page_from = start + 1
+        page_to = start + len(batch)
+
+        prompt = f"""
+You are reading a teacher-uploaded {pdf_label} PDF for a school examination.
+These are pages {page_from} to {page_to} of that PDF.
+
+READ THE PDF PAGE IMAGES CAREFULLY. The PDF may be scanned or handwritten.
+Transcribe the visible content faithfully. Preserve question numbers, subparts,
+marks, equations, chemical formulae, units, diagrams' labels and important wording.
+Do not invent missing or unreadable content. Mark unclear content as [unreadable].
+
+For a QUESTION PAPER PDF:
+- List every question and sub-question in original order.
+- Capture marks allotted to each question if printed.
+- Preserve the exact question wording as closely as possible.
+
+For an IDEAL ANSWER PDF:
+- Match answer numbers to the question numbers.
+- Transcribe the teacher's expected answer, key points, formulae and equations.
+- Preserve marking scheme / step marks if shown.
+
+SEARCHABLE PDF TEXT, if available:
+{extracted_text[:12000] if extracted_text else '[No selectable text. Read the page images.]'}
+
+Return clear structured text, not a grade and not a student evaluation.
+"""
+        observations.append(call_vision_ai(prompt, batch, max_tokens=3000))
+
+    return "\n\n".join(observations)
+
+
+def parse_json_from_ai(text: str) -> dict:
+    """Accept plain JSON or JSON enclosed in a Markdown code fence."""
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start < 0 or end <= start:
+        raise RuntimeError("AI did not return the required structured evaluation.")
+    return json.loads(cleaned[start:end + 1])
+
+
+# ---------------------------- EVALUATION HELPERS ----------------------------
+
+def evaluate_student_with_ai(test: dict, answer_page_urls: list) -> dict:
+    question_reference = test.get("question_reference", "")
+    ideal_reference = test.get("ideal_reference", "")
+
+    # First, read/transcribe the student's pages in batches.
+    student_page_notes = []
+    for start in range(0, len(answer_page_urls), 3):
+        batch = answer_page_urls[start:start + 3]
+        page_from = start + 1
+        page_to = start + len(batch)
+
+        prompt = f"""
+You are assisting a school examiner. Read only the student's uploaded answer-sheet
+pages {page_from} to {page_to}. Do not award marks yet.
+
+TEACHER'S QUESTION PAPER (transcribed from the teacher's uploaded question PDF):
+{question_reference[:14000]}
+
+Transcribe each visible student answer and its question number. Preserve equations,
+chemical formulae, units and calculations. State clearly when an answer is missing
+or handwriting is unreadable. Do not guess. Include page numbers in your notes.
+"""
+        student_page_notes.append(
+            call_vision_ai(prompt, batch, max_tokens=3000)
+        )
+
+    student_transcription = "\n\n".join(student_page_notes)
+
+    # Final evaluation: force each question into the exact requested structure.
+    final_prompt = f"""
+You are the strict but fair examiner for Safal Academy Live, Giridih.
+
+Evaluate this student's complete answer sheet using ONLY the teacher-uploaded
+question paper and teacher-uploaded ideal-answer PDF as the official references.
 
 TEST DETAILS
-Subject: {test['subject']}
 Class: {test['target_class']}
-Test code: {test['test_code']}
-Maximum marks: {test['total_marks']}
+Subject: {test['subject']}
+Test Code: {test['test_code']}
+Maximum total marks: {test['total_marks']}
 
-QUESTION PAPER TEXT:
-{test.get('sqp_text') or '[No selectable text was extracted from the question paper PDF.]'}
+TEACHER-UPLOADED QUESTION PAPER PDF (AI-READ TRANSCRIPTION):
+{question_reference[:16000]}
 
-IDEAL ANSWER TEXT:
-{test.get('ideal_text') or '[No selectable text was extracted from the ideal answer PDF.]'}
+TEACHER-UPLOADED IDEAL ANSWER PDF (AI-READ TRANSCRIPTION):
+{ideal_reference[:16000]}
 
-PAGE-WISE OBSERVATIONS:
-{notes[:24000]}
+STUDENT ANSWER SHEET TRANSCRIPTION FROM UPLOADED PHOTOS:
+{student_transcription[:16000]}
 
-INSTRUCTIONS:
-1. Award marks only for answers actually visible in the student's uploaded pages.
-2. Compare with the ideal answer where available. Give credit for scientifically/mathematically
-   correct equivalent methods and wording.
-3. Do not invent answers or assume missing pages.
-4. Keep awarded marks between 0 and {test['total_marks']}.
-5. Mention question-wise marks, correct points, mistakes, missing steps and suggestions.
-6. If reference text is unavailable, clearly disclose that limitation in feedback.
-7. Output exactly in this format:
-MARKS: <number>
-FEEDBACK:
-<detailed question-wise evaluation and overall advice>
+MANDATORY EVALUATION RULES:
+1. Evaluate all questions found in the teacher's question paper, in the same order and
+   with the same question numbers. Do not invent additional questions.
+2. Match each student answer to the correct question number. Do not confuse a student's
+   written question label with the printed question number; use the actual content too.
+3. Use the teacher's ideal-answer PDF as the primary marking reference. Do not replace
+   it with a generic textbook answer. If the ideal PDF does not contain an answer or is
+   unreadable, say so explicitly in ideal_answer.
+4. For every question show:
+   - question: exact question text from teacher's question paper
+   - student_answer: what the student actually wrote; if blank, write "No answer found"
+   - max_marks: marks allotted in the teacher's question paper
+   - awarded_marks: marks earned by the student
+   - deduction_reason: specific reason for every lost mark. If full marks, write "No marks deducted."
+   - ideal_answer: answer from the teacher's ideal-answer PDF, preserving its method/content.
+5. Do not award marks for an answer that is not present. Do not assume unreadable text.
+6. Give partial marks only for correct visible points/steps. Do not deduct twice for the
+   same mistake. Award mathematically/scientifically equivalent answers when justified
+   by the teacher's ideal answer.
+7. The sum of question max_marks must not exceed {test['total_marks']}. The sum of
+   awarded_marks must not exceed the total. If question-wise marks are absent from the
+   question PDF, distribute the total marks fairly across its questions and disclose
+   this in overall_feedback.
+8. Keep student_answer and ideal_answer readable and sufficiently detailed.
+9. Return ONLY valid JSON. No Markdown fences, no text before or after JSON.
+10. Use exactly this JSON structure:
+{{
+  "questions": [
+    {{
+      "question_number": "1",
+      "question": "Full question text",
+      "student_answer": "Student's answer or No answer found",
+      "max_marks": 2,
+      "awarded_marks": 1,
+      "deduction_reason": "Specific reason for deduction",
+      "ideal_answer": "Teacher's ideal answer"
+    }}
+  ],
+  "overall_feedback": "Short overall feedback and improvement advice"
+}}
 """
-    response = get_ai_client().chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        max_completion_tokens=4000,
-    )
-    answer = response.choices[0].message.content
-    if not answer:
-        raise RuntimeError("AI returned an empty final evaluation.")
-    return answer
+    raw_result = call_vision_ai(final_prompt, [], max_tokens=5000)
+    result = parse_json_from_ai(raw_result)
+
+    questions = result.get("questions")
+    if not isinstance(questions, list) or not questions:
+        raise RuntimeError("AI did not return question-wise evaluation.")
+
+    total_max = 0.0
+    total_awarded = 0.0
+    cleaned_questions = []
+
+    for index, item in enumerate(questions, start=1):
+        try:
+            max_marks = max(0.0, float(item.get("max_marks", 0)))
+            awarded = max(0.0, float(item.get("awarded_marks", 0)))
+        except (TypeError, ValueError):
+            raise RuntimeError(f"Invalid marks returned for question {index}.")
+
+        if awarded > max_marks:
+            awarded = max_marks
+
+        total_max += max_marks
+        total_awarded += awarded
+
+        cleaned_questions.append({
+            "question_number": str(item.get("question_number", index)),
+            "question": str(item.get("question", "Question text not readable")),
+            "student_answer": str(item.get("student_answer", "No answer found")),
+            "max_marks": max_marks,
+            "awarded_marks": awarded,
+            "deduction_reason": str(item.get("deduction_reason", "Not specified by AI")),
+            "ideal_answer": str(item.get("ideal_answer", "Not available in teacher's ideal-answer PDF")),
+        })
+
+    # Scale only if AI's question totals exceed the test maximum.
+    # Preserve awarded marks proportionally and clearly flag this in feedback.
+    overall_feedback = str(result.get("overall_feedback", ""))
+    if total_max > float(test["total_marks"]) and total_max > 0:
+        factor = float(test["total_marks"]) / total_max
+        for item in cleaned_questions:
+            item["max_marks"] = round(item["max_marks"] * factor, 2)
+            item["awarded_marks"] = round(item["awarded_marks"] * factor, 2)
+        overall_feedback += (
+            " Note: The AI's question-wise maximum marks exceeded the test maximum; "
+            "question marks were proportionally adjusted to the test total."
+        )
+
+    total_awarded = sum(item["awarded_marks"] for item in cleaned_questions)
+    total_awarded = min(total_awarded, float(test["total_marks"]))
+
+    return {
+        "questions": cleaned_questions,
+        "overall_feedback": overall_feedback,
+        "awarded_marks": round(total_awarded, 2),
+    }
 
 
-def parse_marks_and_feedback(ai_reply: str, total_marks: float):
-    match = re.search(r"MARKS\s*:\s*(-?\d+(?:\.\d+)?)", ai_reply, re.IGNORECASE)
-    if not match:
-        raise RuntimeError("AI response did not contain a valid MARKS: value.")
-    marks = float(match.group(1))
-    marks = max(0.0, min(marks, float(total_marks)))
-    feedback_match = re.search(
-        r"FEEDBACK\s*:\s*(.*)", ai_reply, re.IGNORECASE | re.DOTALL
-    )
-    feedback = feedback_match.group(1).strip() if feedback_match else ai_reply.strip()
-    return marks, feedback
+# ---------------------------- PDF REPORT ----------------------------
 
-
-def safe_pdf_text(value) -> str:
-    return html.escape(str(value)).replace("\n", "<br/>")
+def reportlab_markup(text: str) -> str:
+    """Escape text and convert basic Markdown bold/italic to ReportLab markup."""
+    safe = html.escape(str(text or ""))
+    safe = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", safe, flags=re.DOTALL)
+    safe = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", safe)
+    safe = safe.replace("\n", "<br/>")
+    return safe
 
 
 def make_result_pdf(student_name: str, student_class: str, school_name: str,
-                    test: dict, awarded_marks: float, feedback: str) -> str:
+                    test: dict, evaluation: dict) -> str:
     fd, pdf_path = tempfile.mkstemp(suffix=".pdf")
     os.close(fd)
 
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(
-        "MainTitle", parent=styles["Heading1"], fontSize=20,
-        textColor=colors.white, alignment=1, spaceAfter=8
+        "MainTitle", parent=styles["Heading1"], fontSize=19,
+        textColor=colors.white, alignment=1, spaceAfter=5
     )
     subtitle_style = ParagraphStyle(
-        "SubTitle", parent=styles["Heading3"], fontSize=11,
+        "SubTitle", parent=styles["Normal"], fontSize=10,
         textColor=colors.white, alignment=1
     )
-    feedback_style = ParagraphStyle(
-        "FeedbackStyle", parent=styles["Normal"], fontSize=10,
-        leading=15, textColor=colors.HexColor("#1F2937")
+    section_style = ParagraphStyle(
+        "QuestionHeading", parent=styles["Heading3"], fontSize=11,
+        leading=14, textColor=colors.HexColor("#1E3A8A"), spaceBefore=8, spaceAfter=6
     )
-    story = []
+    body_style = ParagraphStyle(
+        "BodyTextCustom", parent=styles["Normal"], fontSize=9.5,
+        leading=14, textColor=colors.HexColor("#1F2937"), spaceAfter=5
+    )
+    label_style = ParagraphStyle(
+        "LabelCustom", parent=body_style, fontSize=9.5, leading=14
+    )
 
+    story = []
     header = Table(
         [[Paragraph("<b>SAFAL ACADEMY LIVE</b>", title_style)],
          [Paragraph("Barganda, Giridih - Detailed Evaluation Report", subtitle_style)]],
@@ -209,73 +390,110 @@ def make_result_pdf(student_name: str, student_class: str, school_name: str,
     header.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#1E3A8A")),
         ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("TOPPADDING", (0, 0), (-1, -1), 10),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 9),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
     ]))
     story.append(header)
-    story.append(Spacer(1, 18))
+    story.append(Spacer(1, 14))
 
     details = [
         ["Student Name:", student_name, "Class:", student_class],
         ["School Name:", school_name, "Evaluated By:", "RAVISH SIR"],
         ["Test Code:", test["test_code"], "Subject:", test["subject"]],
     ]
-    details_table = Table(details, colWidths=[90, 160, 90, 160])
+    details_table = Table(details, colWidths=[88, 162, 90, 160])
     details_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F3F4F6")),
         ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#F3F4F6")),
         ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
         ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
-        ("GRID", (0, 0), (-1, -1), 0.7, colors.HexColor("#D1D5DB")),
-        ("PADDING", (0, 0), (-1, -1), 8),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("GRID", (0, 0), (-1, -1), 0.6, colors.HexColor("#D1D5DB")),
+        ("PADDING", (0, 0), (-1, -1), 7),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
     ]))
     story.append(details_table)
-    story.append(Spacer(1, 18))
+    story.append(Spacer(1, 12))
 
-    percentage = (awarded_marks / test["total_marks"] * 100) if test["total_marks"] else 0
-    mark_color = colors.HexColor("#16A34A") if percentage >= 40 else colors.HexColor("#DC2626")
-    mark_bg = colors.HexColor("#ECFDF5") if percentage >= 40 else colors.HexColor("#FEF2F2")
-    marks_table = Table(
-        [[Paragraph(
-            f"<b>TOTAL MARKS AWARDED: {awarded_marks:g} / {test['total_marks']:g}</b>",
-            ParagraphStyle("Marks", fontSize=15, textColor=mark_color, alignment=1)
-        )]],
-        colWidths=[500]
-    )
-    marks_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), mark_bg),
-        ("BOX", (0, 0), (-1, -1), 1.5, mark_color),
-        ("PADDING", (0, 0), (-1, -1), 14),
+    total = float(test["total_marks"])
+    awarded_total = float(evaluation["awarded_marks"])
+    percentage = (awarded_total / total * 100) if total else 0
+    mark_color = colors.HexColor("#15803D") if percentage >= 40 else colors.HexColor("#B91C1C")
+    marks_box = Table([[
+        Paragraph(
+            f"<b>TOTAL MARKS: {awarded_total:g} / {total:g} "
+            f"({percentage:.1f}%)</b>",
+            ParagraphStyle("Marks", fontSize=14, textColor=mark_color, alignment=1)
+        )
+    ]], colWidths=[500])
+    marks_box.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8FAFC")),
+        ("BOX", (0, 0), (-1, -1), 1, mark_color),
+        ("PADDING", (0, 0), (-1, -1), 10),
     ]))
-    story.append(marks_table)
+    story.append(marks_box)
+    story.append(Spacer(1, 12))
+
+    # Requested format for EVERY question:
+    # Question -> Student Answer -> Allotted/Awarded Marks ->
+    # Cause of Deduction -> Ideal Answer -> Next Question.
+    for item in evaluation["questions"]:
+        q_heading = (
+            f"Question {html.escape(item['question_number'])} "
+            f"({item['awarded_marks']:g} / {item['max_marks']:g} marks)"
+        )
+        blocks = [
+            Paragraph(q_heading, section_style),
+            Paragraph(f"<b>Question:</b> {reportlab_markup(item['question'])}", label_style),
+            Paragraph(f"<b>Student Answer:</b> {reportlab_markup(item['student_answer'])}", label_style),
+            Paragraph(
+                f"<b>Allotted Marks:</b> {item['max_marks']:g} "
+                f"&nbsp;&nbsp; <b>Marks Awarded:</b> {item['awarded_marks']:g}",
+                label_style
+            ),
+            Paragraph(
+                f"<b>Cause of Deduction of Marks:</b> {reportlab_markup(item['deduction_reason'])}",
+                label_style
+            ),
+            Paragraph(f"<b>Ideal Answer:</b> {reportlab_markup(item['ideal_answer'])}", label_style),
+            Spacer(1, 8),
+        ]
+        question_table = Table([[blocks]], colWidths=[500])
+        question_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+            ("BOX", (0, 0), (-1, -1), 0.7, colors.HexColor("#CBD5E1")),
+            ("LEFTPADDING", (0, 0), (-1, -1), 9),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        story.append(KeepTogether([question_table, Spacer(1, 7)]))
+
+    story.append(Paragraph("<b>Overall Feedback:</b>", section_style))
+    story.append(Paragraph(reportlab_markup(evaluation.get("overall_feedback", "")), body_style))
     story.append(Spacer(1, 18))
-    story.append(Paragraph(
-        "<b><font color='#2563EB'>Detailed Evaluation Feedback & Deductions</font></b>",
-        styles["Heading3"]
-    ))
-    story.append(Spacer(1, 6))
-    story.append(Paragraph(safe_pdf_text(feedback), feedback_style))
-    story.append(Spacer(1, 24))
     story.append(Paragraph(
         "<b>POWERED BY RAVISH SIR</b>",
         ParagraphStyle("Footer", parent=styles["Italic"], alignment=1,
                        textColor=colors.HexColor("#DC2626"))
     ))
 
-    SimpleDocTemplate(pdf_path, pagesize=letter).build(story)
+    SimpleDocTemplate(
+        pdf_path, pagesize=letter,
+        rightMargin=42, leftMargin=42, topMargin=36, bottomMargin=36
+    ).build(story)
     return pdf_path
 
 
-# -------------------------- BASIC ROUTES --------------------------
+# ---------------------------- GENERAL ROUTES ----------------------------
 
 @app.get("/")
 def home():
     return {
         "service": "Safal Academy Live AI Copy Evaluator",
         "status": "online",
+        "version": "3.0.0",
         "docs": "/docs",
-        "evaluation_route": "/student/evaluate"
+        "evaluation_route": "/student/evaluate",
     }
 
 
@@ -284,11 +502,11 @@ def health():
     return {
         "status": "ok",
         "groq_key_configured": bool(GROQ_API_KEY),
-        "model": GROQ_MODEL
+        "model": GROQ_MODEL,
     }
 
 
-# -------------------------- TEACHER ROUTES --------------------------
+# ---------------------------- TEACHER ROUTES ----------------------------
 
 @app.post("/teacher/login")
 def teacher_login(password: str = Form(...)):
@@ -305,16 +523,25 @@ async def upload_test(
     total_marks: float = Form(...),
     expiration: Optional[str] = Form(None),
     sqp: UploadFile = File(...),
-    ideal_answer: UploadFile = File(...)
+    ideal_answer: UploadFile = File(...),
 ):
     if total_marks <= 0:
         raise HTTPException(status_code=400, detail="Total marks must be greater than zero.")
 
-    sqp_bytes = await sqp.read()
-    ideal_bytes = await ideal_answer.read()
+    question_pdf = await sqp.read()
+    ideal_pdf = await ideal_answer.read()
 
-    if not sqp_bytes or not ideal_bytes:
-        raise HTTPException(status_code=400, detail="Question paper and ideal answer PDFs are required.")
+    if not question_pdf or not ideal_pdf:
+        raise HTTPException(
+            status_code=400,
+            detail="Teacher must upload both Question Paper PDF and Ideal Answer PDF."
+        )
+
+    # Validate and read both teacher PDFs now, before publishing the test.
+    question_images = pdf_to_image_data_urls(question_pdf, "Question Paper")
+    ideal_images = pdf_to_image_data_urls(ideal_pdf, "Ideal Answer")
+    if not question_images or not ideal_images:
+        raise HTTPException(status_code=400, detail="Both teacher PDFs must contain at least one page.")
 
     test_id = f"{target_class}_{test_code}".strip()
     TESTS_DB[test_id] = {
@@ -324,13 +551,23 @@ async def upload_test(
         "target_class": target_class,
         "total_marks": float(total_marks),
         "expiration": expiration,
-        "sqp_bytes": sqp_bytes,
-        "ideal_bytes": ideal_bytes,
-        "sqp_text": extract_pdf_text(sqp_bytes),
-        "ideal_text": extract_pdf_text(ideal_bytes),
+        "sqp_bytes": question_pdf,
+        "ideal_bytes": ideal_pdf,
+        "sqp_text": extract_pdf_text(question_pdf),
+        "ideal_text": extract_pdf_text(ideal_pdf),
+        "question_images": question_images,
+        "ideal_images": ideal_images,
+        "question_reference": "",
+        "ideal_reference": "",
+        "reference_ready": False,
     }
     RESULTS_DB[test_id] = []
-    return {"status": "published", "test_id": test_id}
+
+    return {
+        "status": "published",
+        "test_id": test_id,
+        "message": "Question Paper PDF and Ideal Answer PDF uploaded successfully.",
+    }
 
 
 @app.get("/teacher/tests/{target_class}")
@@ -351,24 +588,25 @@ def download_results_pdf(test_id: str):
     if test_id not in TESTS_DB:
         raise HTTPException(status_code=404, detail="Test not found. Please publish the test again.")
 
-    results = RESULTS_DB.get(test_id, [])
+    results = sorted(
+        RESULTS_DB.get(test_id, []),
+        key=lambda item: item["marks"],
+        reverse=True
+    )
     fd, pdf_path = tempfile.mkstemp(suffix=".pdf")
     os.close(fd)
-
     styles = getSampleStyleSheet()
     story = [
         Paragraph("<b>Safal Academy Live - Merit List</b>", styles["Title"]),
-        Spacer(1, 12)
+        Spacer(1, 12),
     ]
-    for index, result in enumerate(
-        sorted(results, key=lambda item: item["marks"], reverse=True), start=1
-    ):
-        line = (
-            f"{index}. <b>{safe_pdf_text(result['name'])}</b> "
-            f"({safe_pdf_text(result['school'])}) - "
-            f"Marks: {result['marks']:g} / {result['total']:g}"
-        )
-        story.append(Paragraph(line, styles["Normal"]))
+    for rank, result in enumerate(results, start=1):
+        story.append(Paragraph(
+            f"{rank}. <b>{html.escape(result['name'])}</b> "
+            f"({html.escape(result['school'])}) - "
+            f"Marks: {result['marks']:g} / {result['total']:g}",
+            styles["Normal"]
+        ))
         story.append(Spacer(1, 6))
 
     SimpleDocTemplate(pdf_path, pagesize=letter).build(story)
@@ -380,14 +618,17 @@ def download_results_excel(test_id: str):
     if test_id not in TESTS_DB:
         raise HTTPException(status_code=404, detail="Test not found. Please publish the test again.")
 
-    results = RESULTS_DB.get(test_id, [])
+    results = sorted(
+        RESULTS_DB.get(test_id, []),
+        key=lambda item: item["marks"],
+        reverse=True
+    )
     workbook = openpyxl.Workbook()
     sheet = workbook.active
     sheet.title = "Merit List"
     sheet.append(["Rank", "Student Name", "Email", "Phone", "School", "Marks Obtained", "Total Marks"])
 
-    ordered = sorted(results, key=lambda item: item["marks"], reverse=True)
-    for rank, result in enumerate(ordered, start=1):
+    for rank, result in enumerate(results, start=1):
         sheet.append([
             rank, result["name"], result["email"], result["phone"],
             result["school"], result["marks"], result["total"]
@@ -403,7 +644,7 @@ def download_results_excel(test_id: str):
     )
 
 
-# -------------------------- STUDENT ROUTES --------------------------
+# ---------------------------- STUDENT ROUTES ----------------------------
 
 @app.get("/student/tests")
 def get_student_tests(student_class: str):
@@ -414,7 +655,7 @@ def get_student_tests(student_class: str):
                 "id": test["id"],
                 "test_code": test["test_code"],
                 "subject": test["subject"],
-                "total_marks": test["total_marks"]
+                "total_marks": test["total_marks"],
             })
     return {"tests": active_tests}
 
@@ -427,76 +668,65 @@ async def evaluate_student_copy(
     school_name: str = Form(...),
     student_class: str = Form(...),
     test_id: str = Form(...),
-    answer_pages: List[UploadFile] = File(...)
+    answer_pages: List[UploadFile] = File(...),
 ):
     if test_id not in TESTS_DB:
         raise HTTPException(
             status_code=404,
-            detail="Test not found on server. Teacher must publish the test again."
+            detail="This test is not available on the server. Teacher must publish it again."
         )
 
     if not answer_pages:
         raise HTTPException(status_code=400, detail="Please upload at least one answer page.")
-
     if len(answer_pages) > 20:
         raise HTTPException(status_code=400, detail="Maximum 20 answer pages are allowed.")
 
     test = TESTS_DB[test_id]
 
-    # Convert all answer images first. Qwen vision supports max 3 images per request.
-    image_urls = []
-    for page in answer_pages:
-        raw = await page.read()
-        if not raw:
-            raise HTTPException(status_code=400, detail=f"Empty upload: {page.filename or 'answer page'}")
-        image_urls.append(image_to_data_url(raw))
-
-    # Ask the vision model to inspect the answer pages in batches of up to 3.
-    page_notes = []
     try:
-        for start in range(0, len(image_urls), 3):
-            batch = image_urls[start:start + 3]
-            first_page = start + 1
-            last_page = start + len(batch)
+        # First read both teacher PDFs through AI. This is done once per test,
+        # then cached in memory for later students.
+        if not test.get("reference_ready"):
+            question_reference = transcribe_teacher_pdf(
+                test["sqp_bytes"], "Question Paper"
+            )
+            ideal_reference = transcribe_teacher_pdf(
+                test["ideal_bytes"], "Ideal Answer"
+            )
+            test["question_reference"] = question_reference
+            test["ideal_reference"] = ideal_reference
+            test["reference_ready"] = True
 
-            batch_prompt = f"""
-You are assisting a strict but fair school examiner.
-Inspect only the student's handwritten answer pages {first_page} to {last_page}.
-Test: {test['test_code']} | Class: {test['target_class']} | Subject: {test['subject']}.
-Maximum test marks: {test['total_marks']}.
+        # Read student pages.
+        answer_page_urls = []
+        for page in answer_pages:
+            raw = await page.read()
+            if not raw:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"An uploaded page is empty: {page.filename or 'answer page'}"
+                )
+            answer_page_urls.append(image_bytes_to_data_url(raw))
 
-Question paper text (if extractable):
-{test.get('sqp_text') or '[No selectable text extracted from question paper PDF.]'}
-
-Ideal answer text (if extractable):
-{test.get('ideal_text') or '[No selectable text extracted from ideal answer PDF.]'}
-
-Read the handwriting carefully. Transcribe question numbers and visible answers.
-Identify correct work, mistakes, missing steps, and any unreadable portions.
-Do not guess unclear handwriting. Do not assign the final overall test marks yet.
-Return concise, structured page-wise observations.
-"""
-            page_notes.append(ask_groq_for_batch(batch_prompt, batch))
-
-        final_reply = finalise_marks("\n\n".join(page_notes), test)
-        awarded_marks, feedback = parse_marks_and_feedback(
-            final_reply, test["total_marks"]
-        )
+        evaluation = evaluate_student_with_ai(test, answer_page_urls)
 
     except HTTPException:
         raise
     except Exception as exc:
-        # Do not create a fake zero-mark result when the AI request fails.
+        # Never send an error or fake zero-mark PDF to the student.
         error_text = str(exc)
-        print(f"AI evaluation error: {error_text}")
-        if "401" in error_text or "invalid_api_key" in error_text.lower():
-            detail = "Groq rejected the API key. Check GROQ_API_KEY in Render Environment."
-        elif "429" in error_text:
-            detail = "Groq rate limit/quota reached. Wait and try again."
-        elif "model" in error_text.lower() and ("not found" in error_text.lower() or "decommission" in error_text.lower()):
-            detail = f"Groq model is unavailable: {GROQ_MODEL}. Check the current Groq model list."
+        print(f"Evaluation failure for test {test_id}: {error_text}")
+
+        lowered = error_text.lower()
+        if "401" in error_text or "invalid_api_key" in lowered:
+            detail = "Evaluation is temporarily unavailable. Please inform the teacher."
+        elif "429" in error_text or "rate limit" in lowered:
+            detail = "Evaluation is temporarily busy. Please try again later."
+        elif "model" in lowered and ("not found" in lowered or "decommission" in lowered):
+            detail = "Evaluation service configuration needs attention. Please inform the teacher."
         else:
-            detail = f"AI evaluation failed: {error_text[:500]}"
+            detail = "Evaluation could not be completed. Please try again or contact the teacher."
+
         raise HTTPException(status_code=502, detail=detail)
 
     result_record = {
@@ -504,19 +734,23 @@ Return concise, structured page-wise observations.
         "email": student_email,
         "phone": student_phone,
         "school": school_name,
-        "marks": awarded_marks,
-        "feedback": feedback,
+        "marks": evaluation["awarded_marks"],
+        "feedback": evaluation.get("overall_feedback", ""),
         "total": test["total_marks"],
     }
     RESULTS_DB.setdefault(test_id, []).append(result_record)
 
     pdf_path = make_result_pdf(
-        student_name, student_class, school_name,
-        test, awarded_marks, feedback
+        student_name=student_name,
+        student_class=student_class,
+        school_name=school_name,
+        test=test,
+        evaluation=evaluation,
     )
+
     safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", student_name).strip("_") or "Student"
     return FileResponse(
         pdf_path,
         media_type="application/pdf",
-        filename=f"Result_{safe_name}.pdf"
+        filename=f"Result_{safe_name}.pdf",
     )
