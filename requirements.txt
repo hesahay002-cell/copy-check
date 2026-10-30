@@ -1,8 +1,8 @@
 fastapi
-uvicorn
+uvicorn[standard]
 python-multipart
 openai
-reportlab
-openpyxl
-PyMuPDF
 Pillow
+openpyxl
+reportlab
+pypdf
