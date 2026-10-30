@@ -6,6 +6,8 @@ import html
 import uuid
 import logging
 import tempfile
+import time
+import threading
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -36,7 +38,7 @@ from reportlab.platypus import (
 #   uvicorn main:app --host 0.0.0.0 --port $PORT
 #
 # Render Environment Variables:
-#   GROQ_API_KEY = your NEW Groq API key
+#   GROQ_API_KEY_1 = first separately authorized Groq account key\n#   GROQ_API_KEY_2 = second separately authorized Groq account key
 #   GROQ_MODEL   = qwen/qwen3.8-27b
 #   TEACHER_PIN  = optional; defaults to the existing PIN 525077
 #
@@ -55,7 +57,7 @@ logger = logging.getLogger("safal-copy-check")
 
 app = FastAPI(
     title="Safal Academy Live - Vision AI Copy Evaluator",
-    version="4.0.0"
+    version="6.0.0"
 )
 
 app.add_middleware(
@@ -66,18 +68,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b").strip()
 TEACHER_PIN = os.getenv("TEACHER_PIN", "525077")
 
-AI_CLIENT = None
-if GROQ_API_KEY:
-    AI_CLIENT = OpenAI(
-        api_key=GROQ_API_KEY,
+# Keys should belong to two separately authorized Groq accounts/organizations.
+# Never print or log the actual secret values.
+GROQ_KEYS = [
+    os.getenv("GROQ_API_KEY_1", "").strip(),
+    os.getenv("GROQ_API_KEY_2", "").strip(),
+]
+GROQ_KEYS = [key for key in GROQ_KEYS if key]
+AI_CLIENTS = [
+    OpenAI(
+        api_key=key,
         base_url="https://api.groq.com/openai/v1",
         timeout=240.0,
-        max_retries=1,
+        max_retries=0,
     )
+    for key in GROQ_KEYS
+]
+_CLIENT_LOCK = threading.Lock()
+_NEXT_CLIENT_INDEX = 0
 
 # Temporary in-memory storage. Render restarts clear this data.
 TESTS_DB = {}
@@ -91,87 +102,67 @@ VISION_IMAGES_PER_REQUEST = 3
 
 # ------------------------------ COMMON HELPERS ------------------------------
 
-def require_ai():
-    if not GROQ_API_KEY or AI_CLIENT is None:
+def get_ai_clients():
+    if not AI_CLIENTS:
         raise HTTPException(
             status_code=503,
-            detail="AI service is not configured. Please inform the teacher."
+            detail="AI service is not configured. Add GROQ_API_KEY_1 and GROQ_API_KEY_2 in Render."
         )
-    return AI_CLIENT
+    return AI_CLIENTS
 
 
-def safe_filename(value: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", value or "").strip("_")
-    return cleaned[:60] or "Student"
+def _next_client_order():
+    """Return clients in round-robin order, starting from the next account."""
+    global _NEXT_CLIENT_INDEX
+    clients = get_ai_clients()
+    with _CLIENT_LOCK:
+        start_index = _NEXT_CLIENT_INDEX % len(clients)
+        _NEXT_CLIENT_INDEX = (start_index + 1) % len(clients)
+    return clients[start_index:] + clients[:start_index]
 
 
-def image_to_data_url(raw: bytes, max_side: int = 1500, quality: int = 76) -> str:
-    """Normalize/rotate/compress a student or PDF-rendered page for Vision AI."""
-    try:
-        with Image.open(io.BytesIO(raw)) as original:
-            image = ImageOps.exif_transpose(original).convert("RGB")
-            image.thumbnail((max_side, max_side))
-            output = io.BytesIO()
-            image.save(output, format="JPEG", quality=quality, optimize=True)
-            encoded = output.getvalue()
-    except Exception as exc:
-        raise ValueError(f"Image could not be opened: {exc}")
-
-    if len(encoded) > MAX_UPLOAD_BYTES:
-        raise ValueError("Image is too large after compression.")
-    import base64
-    return "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")
-
-
-def pdf_pages_as_images(pdf_bytes: bytes, label: str):
-    """Render every page of teacher's PDF; works with scanned PDFs too."""
-    try:
-        document = fitz.open(stream=pdf_bytes, filetype="pdf")
-        if document.page_count < 1:
-            raise ValueError("PDF has no pages.")
-        if document.page_count > MAX_PDF_PAGES:
-            raise ValueError(f"{label} PDF has more than {MAX_PDF_PAGES} pages.")
-
-        pages = []
-        for page_index in range(document.page_count):
-            page = document.load_page(page_index)
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.55, 1.55), alpha=False)
-            pages.append({
-                "page_number": page_index + 1,
-                "text": (page.get_text("text") or "").strip(),
-                "image": image_to_data_url(pix.tobytes("png"), max_side=1500, quality=76),
-            })
-        document.close()
-        return pages
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not read {label} PDF. Please upload a valid PDF. ({exc})"
-        )
+def _retry_delay_from_error(exc, default_seconds=30):
+    """Read Retry-After when the SDK exposes response headers."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    retry_after = headers.get("retry-after") or headers.get("x-ratelimit-reset-requests")
+    if retry_after:
+        try:
+            # Retry-After is usually seconds; Groq reset headers can be durations.
+            match = re.match(r"^(\\d+(?:\\.\\d+)?)(ms|s|m)?$", str(retry_after).strip(), re.I)
+            if match:
+                value = float(match.group(1))
+                unit = (match.group(2) or "s").lower()
+                if unit == "ms":
+                    value /= 1000
+                elif unit == "m":
+                    value *= 60
+                return max(2, min(int(value) + 2, 300))
+        except Exception:
+            pass
+    return default_seconds
 
 
-def call_vision(prompt: str, image_urls: list, max_tokens: int = 5000,
+def call_vision(prompt: str, image_urls: list, max_tokens: int = 2200,
                 json_mode: bool = False) -> str:
-    """Call Groq Qwen Vision. Never convert provider errors into marks."""
-    client = require_ai()
+    """
+    Groq Vision caller:
+    - rotates across the configured account keys,
+    - immediately tries the other account on 429,
+    - waits and retries if both accounts are rate-limited,
+    - never converts API failures into student marks.
+    """
+    clients = get_ai_clients()
     content = [{"type": "text", "text": prompt}]
     for url in image_urls:
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": url}
-        })
+        content.append({"type": "image_url", "image_url": {"url": url}})
 
     kwargs = {
         "model": GROQ_MODEL,
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a careful visual reader and school examination assistant. "
-                    "Read the supplied page images directly. Never pretend unreadable "
-                    "handwriting is clear. Do not invent missing answers."
-                )
-            },
+            {"role": "system", "content":
+             "You are a careful visual reader and school examination assistant. "
+             "Read page images directly. Never invent missing answers."},
             {"role": "user", "content": content}
         ],
         "temperature": 0.1,
@@ -180,11 +171,50 @@ def call_vision(prompt: str, image_urls: list, max_tokens: int = 5000,
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
 
-    response = client.chat.completions.create(**kwargs)
-    answer = response.choices[0].message.content
-    if not answer or not answer.strip():
-        raise RuntimeError("Vision AI returned an empty response.")
-    return answer.strip()
+    # Up to 20 wait cycles (10 minutes max, excluding provider processing time).
+    for cycle in range(20):
+        rate_errors = []
+        for account_number, client in enumerate(_next_client_order(), start=1):
+            try:
+                logger.info(
+                    "Calling Groq Vision using configured account slot %s/%s",
+                    account_number, len(clients)
+                )
+                response = client.chat.completions.create(**kwargs)
+                answer = response.choices[0].message.content
+                if not answer or not answer.strip():
+                    raise RuntimeError("Vision AI returned an empty response.")
+                return answer.strip()
+            except Exception as exc:
+                message = str(exc).lower()
+                is_rate_limit = (
+                    "429" in message or "rate_limit" in message
+                    or "rate limit" in message or "tokens per minute" in message
+                )
+                if is_rate_limit:
+                    rate_errors.append(exc)
+                    logger.warning(
+                        "Groq account slot %s rate-limited; trying next configured account.",
+                        account_number
+                    )
+                    continue
+                raise
+
+        # Both configured accounts are rate-limited. Wait for quota to refresh.
+        if rate_errors:
+            delays = [_retry_delay_from_error(err) for err in rate_errors]
+            wait_seconds = max(5, min(max(delays), 300))
+            logger.warning(
+                "Both Groq account slots are rate-limited. Waiting %s seconds; cycle %s/20.",
+                wait_seconds, cycle + 1
+            )
+            time.sleep(wait_seconds)
+            continue
+
+    raise RuntimeError(
+        "Both Groq accounts remained rate-limited for 10 minutes. "
+        "No marks were generated; please retry the saved submission."
+    )
 
 
 def parse_json_response(raw: str) -> dict:
@@ -298,7 +328,7 @@ Return the transcription page by page. For each answer fragment include:
 - any unclear words/equations
 - whether the answer appears continued on another page, if visible
 """
-        notes = call_vision(prompt, batch_urls, max_tokens=6000)
+        notes = call_vision(prompt, batch_urls, max_tokens=2200)
         all_page_notes.append(
             f"===== STUDENT COPY: PAGES {first_page}-{last_page} =====\n{notes}"
         )
@@ -326,10 +356,22 @@ def audit_evaluation_against_original_images(
 
         relevant = []
         for item in audited:
+            answer_text = str(item.get("student_answer", "")).strip().lower()
             page_numbers = {
-                int(x) for x in re.findall(r"\d+", str(item.get("pages_found", "")))
+                int(x) for x in re.findall(r"\\d+", str(item.get("pages_found", "")))
             }
-            if any(first_page <= n <= last_page for n in page_numbers):
+            answer_missing = (
+                not answer_text
+                or "no answer found" in answer_text
+                or answer_text in {"not identified", "not found"}
+            )
+            # Missing answers must be searched in every original page batch;
+            # the earlier version skipped them because they had no page number.
+            if (
+                answer_missing
+                or item.get("review_required")
+                or any(first_page <= n <= last_page for n in page_numbers)
+            ):
                 relevant.append(item)
 
         if not relevant:
@@ -347,18 +389,16 @@ PREVIOUS TRANSCRIPTION FOR CONTEXT:
 CURRENT QUESTION EVALUATIONS TO CHECK:
 {json.dumps(relevant, ensure_ascii=False)[:14000]}
 
-For each listed question whose answer appears on these attached pages:
-1. Check the exact words in the original handwriting, especially words previously
-   described as [unclear handwriting] or illegible.
-2. If a word is readable, give the actual likely word. Never label a readable
-   wrong answer as illegible. If it is genuinely unreadable, keep it unclear.
-3. Check whether the scientific statement is correct. Do not confuse the colour
-   of a solution with the colour of a deposit/precipitate.
-4. Keep marks unchanged unless the visual evidence proves the existing marking
-   was based on a misread word or factual mistake. Apply the teacher's ideal
-   answer and the stated maximum marks.
-5. If the image does not contain that question's answer, do not change it.
-6. Do not invent letters or award marks for content that is not visible.
+For each listed question:
+1. If student_answer says "No answer found", actively search these original
+   page images for an answer matching the question by meaning and sequence.
+   If found, transcribe it and grade it against the teacher's ideal answer.
+   If absent from these pages, leave it missing; other page batches are checked too.
+2. Check exact words. A readable but scientifically wrong word is WRONG, not
+   illegible. Use [unclear handwriting] only if letters truly cannot be read.
+3. Check scientific meaning. Do not confuse solution colour with deposit colour.
+4. Change marks only when visible evidence proves the current evaluation wrong.
+   Respect maximum marks. Never invent letters or credit invisible content.
 
 Return ONLY JSON:
 {{
@@ -376,7 +416,7 @@ Return ONLY JSON:
 }}
 If no changes are needed, return {{"corrections":[]}}.
 """
-        raw = call_vision(prompt, batch_urls, max_tokens=3500, json_mode=True)
+        raw = call_vision(prompt, batch_urls, max_tokens=1200, json_mode=True)
         audit_data = parse_json_response(raw)
         corrections = audit_data.get("corrections", [])
         if not isinstance(corrections, list):
@@ -524,7 +564,7 @@ JSON shape:
   "overall_review_reason": ""
 }}
 """
-    raw = call_vision(prompt, [], max_tokens=9000, json_mode=True)
+    raw = call_vision(prompt, [], max_tokens=4500, json_mode=True)
     data = parse_json_response(raw)
 
     if not isinstance(data.get("questions"), list) or not data["questions"]:
@@ -816,7 +856,8 @@ def home():
 def health():
     return {
         "status": "ok",
-        "groq_key_configured": bool(GROQ_API_KEY),
+        "groq_key_configured": bool(AI_CLIENTS),
+        "groq_accounts_configured": len(AI_CLIENTS),
         "model": GROQ_MODEL,
         "vision_images_per_request": VISION_IMAGES_PER_REQUEST,
         "max_student_pages": MAX_STUDENT_PAGES,
