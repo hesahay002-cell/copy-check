@@ -1,5 +1,6 @@
 import os
 import io
+import base64
 import re
 import json
 import html
@@ -69,7 +70,7 @@ app.add_middleware(
 )
 
 GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b").strip()
-TEACHER_PIN = os.getenv("TEACHER_PIN", "525077")
+TEACHER_PIN = os.getenv("TEACHER_PIN", "525077").strip()
 
 # Keys should belong to two separately authorized Groq accounts/organizations.
 # Never print or log the actual secret values.
@@ -98,6 +99,45 @@ MAX_STUDENT_PAGES = 20
 MAX_PDF_PAGES = 40
 MAX_UPLOAD_BYTES = 18 * 1024 * 1024
 VISION_IMAGES_PER_REQUEST = 3
+
+
+
+def image_to_data_url(raw: bytes) -> str:
+    """Validate an uploaded image and return a compact JPEG data URL."""
+    try:
+        with Image.open(io.BytesIO(raw)) as image:
+            image = ImageOps.exif_transpose(image).convert("RGB")
+            image.thumbnail((1800, 1800))
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=82, optimize=True)
+        encoded = base64.b64encode(output.getvalue()).decode("ascii")
+        return "data:image/jpeg;base64," + encoded
+    except Exception as exc:
+        raise ValueError("Unsupported or damaged image. Upload JPG, PNG or WEBP.") from exc
+
+
+def pdf_pages_as_images(pdf_bytes: bytes, label: str) -> list:
+    """Render teacher PDF pages to data URLs for direct Vision AI reading."""
+    try:
+        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"{label} is not a valid PDF.") from exc
+
+    if document.page_count < 1:
+        raise HTTPException(status_code=400, detail=f"{label} PDF has no pages.")
+    if document.page_count > 40:
+        raise HTTPException(status_code=400, detail=f"{label} PDF may contain at most 40 pages.")
+
+    rendered = []
+    try:
+        for page_number in range(document.page_count):
+            page = document.load_page(page_number)
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+            image_bytes = pix.tobytes("png")
+            rendered.append(image_to_data_url(image_bytes))
+    finally:
+        document.close()
+    return rendered
 
 
 # ------------------------------ COMMON HELPERS ------------------------------
@@ -858,6 +898,7 @@ def health():
         "status": "ok",
         "groq_key_configured": bool(AI_CLIENTS),
         "groq_accounts_configured": len(AI_CLIENTS),
+        "teacher_pin_configured": bool(TEACHER_PIN),
         "model": GROQ_MODEL,
         "vision_images_per_request": VISION_IMAGES_PER_REQUEST,
         "max_student_pages": MAX_STUDENT_PAGES,
