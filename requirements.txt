@@ -6,3 +6,4 @@ Pillow
 PyMuPDF
 openpyxl
 reportlab
+firebase-admin
