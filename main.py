@@ -11,7 +11,6 @@ import threading
 from datetime import datetime, timezone
 from typing import List, Optional
 
-import fitz  # PyMuPDF
 import openpyxl
 from PIL import Image, ImageOps
 from fastapi import FastAPI, Form, File, UploadFile, HTTPException
@@ -26,12 +25,11 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-    PageBreak, KeepTogether
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 )
 
 # ================================================================
-# SAFAL ACADEMY LIVE - VISION AI COPY EVALUATOR (FIREBASE & TEXT OPTIMIZED)
+# SAFAL ACADEMY LIVE - AI COPY EVALUATOR (FIREBASE & TEXT OPTIMIZED)
 # ================================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -39,7 +37,7 @@ logger = logging.getLogger("safal-copy-check")
 
 app = FastAPI(
     title="Safal Academy Live - Vision AI Copy Evaluator",
-    version="6.1.0"
+    version="7.0.0"
 )
 
 app.add_middleware(
@@ -50,7 +48,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen-2.5-vl-72b-instruct:free").strip()
 TEACHER_PIN = os.getenv("TEACHER_PIN", "525077").strip()
 
 GROQ_KEYS = [
@@ -85,12 +83,10 @@ if firebase_creds_json:
 else:
     logger.warning("FIREBASE_CREDENTIALS environment variable not found. Falling back to in-memory database.")
 
-# Fallback DBs if Firebase is not configured
 TESTS_DB = {}
 RESULTS_DB = {}
 
 MAX_STUDENT_PAGES = 20
-MAX_PDF_PAGES = 40
 VISION_IMAGES_PER_REQUEST = 3
 
 
@@ -98,7 +94,6 @@ def image_to_data_url(raw: bytes) -> str:
     try:
         with Image.open(io.BytesIO(raw)) as image:
             image = ImageOps.exif_transpose(image).convert("RGB")
-            # Resolution reduced to save tokens and processing time
             image.thumbnail((1200, 1200))
             output = io.BytesIO()
             image.save(output, format="JPEG", quality=82, optimize=True)
@@ -107,37 +102,6 @@ def image_to_data_url(raw: bytes) -> str:
     except Exception as exc:
         raise ValueError("Unsupported or damaged image. Upload JPG, PNG or WEBP.") from exc
 
-
-def extract_pdf_data(pdf_bytes: bytes, label: str) -> list:
-    """Extracts both selectable text and image data URLs for each page."""
-    try:
-        document = fitz.open(stream=pdf_bytes, filetype="pdf")
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"{label} is not a valid PDF.") from exc
-
-    if document.page_count < 1:
-        raise HTTPException(status_code=400, detail=f"{label} PDF has no pages.")
-    if document.page_count > MAX_PDF_PAGES:
-        raise HTTPException(status_code=400, detail=f"{label} PDF may contain at most {MAX_PDF_PAGES} pages.")
-
-    rendered = []
-    try:
-        for page_number in range(document.page_count):
-            page = document.load_page(page_number)
-            text = page.get_text("text").strip()
-            
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
-            image_bytes = pix.tobytes("png")
-            image_url = image_to_data_url(image_bytes)
-            
-            rendered.append({
-                "page_number": page_number + 1,
-                "text": text,
-                "image": image_url
-            })
-    finally:
-        document.close()
-    return rendered
 
 # ------------------------------ COMMON HELPERS ------------------------------
 
@@ -226,54 +190,6 @@ def parse_json_response(raw: str) -> dict:
         raise RuntimeError("AI response was not valid JSON.")
     return json.loads(cleaned[first:last + 1])
 
-# ----------------------- TEACHER PDF VISION READING -------------------------
-
-def process_teacher_reference(pages: list, pdf_kind: str) -> str:
-    """Uses extracted text if sufficient, otherwise falls back to Vision AI."""
-    all_text = ""
-    needs_vision = False
-    
-    for page in pages:
-        if len(page["text"]) < 50: # Arbitrary threshold, if page has very little text, it might be an image/scan
-            needs_vision = True
-            break
-        all_text += f"\n--- Page {page['page_number']} ---\n{page['text']}"
-
-    if not needs_vision:
-        logger.info(f"Using direct text extraction for {pdf_kind} PDF.")
-        return all_text
-        
-    logger.info(f"Falling back to Vision AI for {pdf_kind} PDF due to insufficient text.")
-    return read_teacher_pdf_pages(pages, pdf_kind)
-
-def read_teacher_pdf_pages(pages: list, pdf_kind: str) -> str:
-    all_notes = []
-    for start in range(0, len(pages), VISION_IMAGES_PER_REQUEST):
-        batch = pages[start:start + VISION_IMAGES_PER_REQUEST]
-        image_urls = [p["image"] for p in batch]
-        page_details = "\n".join(
-            f"Page {p['page_number']} text:\n{p['text'][:2000] if p['text'] else '[No text]'}"
-            for p in batch
-        )
-
-        instruction = (
-            "Transcribe every question/sub-question in original order. Preserve marks, units, formulae."
-            if pdf_kind == "question" else
-            "Transcribe answer numbers. Preserve steps, formulae, key terms, step-wise marks."
-        )
-
-        prompt = f"""
-This is the TEACHER'S {pdf_kind.upper()}.
-{instruction}
-Images are pages {[p['page_number'] for p in batch]}.
-Selectable text (may be incomplete):
-{page_details}
-Return a faithful transcription. Do not evaluate any student.
-"""
-        notes = call_vision(prompt, image_urls, max_tokens=4000)
-        all_notes.append(f"--- {pdf_kind.upper()} PAGES {batch[0]['page_number']}-{batch[-1]['page_number']} ---\n{notes}")
-    return "\n\n".join(all_notes)
-
 # ------------------------ STUDENT COPY VISION READING -----------------------
 
 def read_student_copy_pages(page_urls: list) -> str:
@@ -355,7 +271,7 @@ STUDENT:\n{student_transcription[:20000]}
 
 RULES:
 1. Match by content/sequence, not just written number. Search all pages.
-2. Use ideal-answer PDF as primary reference.
+2. Use ideal-answer text as primary reference.
 3. Don't give 0 just for wrong number or unreadable handwriting (set review_required).
 4. Identify WHAT changes in science (e.g. solution vs deposit color).
 Return JSON: {{"questions": [{{"question_number": "1", "question": "", "student_answer": "", "pages_found": "", "max_marks": 2, "awarded_marks": 1.5, "deduction_reason": "", "ideal_answer": "", "review_required": false, "review_reason": ""}}], "overall_feedback": "", "overall_review_required": false, "overall_review_reason": ""}}
@@ -469,30 +385,29 @@ def teacher_login(password: str = Form(...)):
 
 @app.post("/teacher/upload")
 async def upload_test(
-    test_code: str = Form(...), subject: str = Form(...), target_class: str = Form(...),
-    total_marks: float = Form(...), sqp: UploadFile = File(...), ideal_answer: UploadFile = File(...)
+    test_code: str = Form(...), 
+    subject: str = Form(...), 
+    target_class: str = Form(...),
+    total_marks: float = Form(...), 
+    expiration: str = Form(""),
+    question_text: str = Form(""), 
+    ideal_text: str = Form("")
 ):
-    q_bytes = await sqp.read()
-    i_bytes = await ideal_answer.read()
-    
-    # Extract text & images
-    q_pages = extract_pdf_data(q_bytes, "Question Paper")
-    i_pages = extract_pdf_data(i_bytes, "Ideal Answer")
-
-    # Generate references immediately using optimized logic
-    q_ref = process_teacher_reference(q_pages, "question")
-    i_ref = process_teacher_reference(i_pages, "ideal answer")
-
     test_id = f"{target_class}_{test_code}".strip()
+    
     test_data = {
-        "id": test_id, "test_code": test_code, "subject": subject,
-        "target_class": target_class, "total_marks": float(total_marks),
-        "question_reference": q_ref, "ideal_reference": i_ref,
+        "id": test_id, 
+        "test_code": test_code, 
+        "subject": subject,
+        "target_class": target_class, 
+        "total_marks": float(total_marks),
+        "expiration": expiration,
+        "question_reference": question_text, 
+        "ideal_reference": ideal_text,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
 
     if db:
-        # Save to Firebase without image payloads to save space
         db.collection('tests').document(test_id).set(test_data)
     else:
         TESTS_DB[test_id] = test_data
@@ -510,12 +425,36 @@ def get_teacher_tests(target_class: str):
 
 @app.get("/student/tests")
 def get_student_tests(student_class: str):
+    active_tests = []
+    now_local = datetime.now()
+
     if db:
         docs = db.collection('tests').where('target_class', '==', student_class).stream()
-        tests = [{"id": d.id, "test_code": d.to_dict().get('test_code'), "subject": d.to_dict().get('subject'), "total_marks": d.to_dict().get('total_marks')} for d in docs]
+        for d in docs:
+            t = d.to_dict()
+            exp_str = t.get("expiration")
+            if exp_str:
+                try:
+                    exp_date = datetime.strptime(exp_str, "%Y-%m-%dT%H:%M")
+                    if now_local > exp_date:
+                        continue 
+                except:
+                    pass
+            active_tests.append({"id": d.id, "test_code": t.get('test_code'), "subject": t.get('subject'), "total_marks": t.get('total_marks')})
     else:
-        tests = [{"id": t["id"], "test_code": t["test_code"], "subject": t["subject"], "total_marks": t["total_marks"]} for t in TESTS_DB.values() if t["target_class"] == student_class]
-    return {"tests": tests}
+        for t in TESTS_DB.values():
+            if t["target_class"] == student_class:
+                exp_str = t.get("expiration")
+                if exp_str:
+                    try:
+                        exp_date = datetime.strptime(exp_str, "%Y-%m-%dT%H:%M")
+                        if now_local > exp_date:
+                            continue
+                    except:
+                        pass
+                active_tests.append({"id": t["id"], "test_code": t["test_code"], "subject": t["subject"], "total_marks": t["total_marks"]})
+                
+    return {"tests": active_tests}
 
 @app.post("/student/evaluate")
 async def evaluate_student_copy(
@@ -551,6 +490,37 @@ async def evaluate_student_copy(
 
     return FileResponse(pdf_path, media_type="application/pdf", filename=f"Result_{student_name}.pdf")
 
+@app.get("/teacher/results/pdf/{test_id}")
+def download_results_pdf(test_id: str):
+    if db:
+        docs = db.collection('tests').document(test_id).collection('results').stream()
+        results = sorted([d.to_dict() for d in docs], key=lambda i: i.get("marks", 0), reverse=True)
+    else:
+        results = sorted(RESULTS_DB.get(test_id, []), key=lambda i: i["marks"], reverse=True)
+
+    fd, path = tempfile.mkstemp(prefix="safal_merit_", suffix=".pdf")
+    os.close(fd)
+    styles = getSampleStyleSheet()
+    story = [Paragraph("<b>SAFAL ACADEMY LIVE - MERIT LIST</b>", styles["Title"]), Spacer(1, 12)]
+
+    rows = [["Rank", "Student", "School", "Marks", "Status"]]
+    for rank, result in enumerate(results, start=1):
+        status = "Provisional" if result.get("provisional") else "Evaluated"
+        rows.append([str(rank), result.get("name", ""), result.get("school", ""), f"{result.get('marks', 0):g} / {result.get('total', 0):g}", status])
+
+    table = Table(rows, repeatRows=1, colWidths=[40, 130, 130, 100, 80])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#173B75")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("PADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(table)
+    SimpleDocTemplate(path, pagesize=A4).build(story)
+    return FileResponse(path, media_type="application/pdf", filename="Merit_List.pdf")
+
 @app.get("/teacher/results/excel/{test_id}")
 def download_results_excel(test_id: str):
     if db:
@@ -562,7 +532,7 @@ def download_results_excel(test_id: str):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.append(["Name", "School", "Marks", "Total", "Status"])
-    for r in results: ws.append([r["name"], r.get("school",""), r["marks"], r["total"], "Provisional" if r.get("provisional") else "Evaluated"])
+    for r in results: ws.append([r.get("name", ""), r.get("school",""), r.get("marks", 0), r.get("total", 0), "Provisional" if r.get("provisional") else "Evaluated"])
     
     fd, path = tempfile.mkstemp(suffix=".xlsx")
     os.close(fd)
